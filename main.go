@@ -41,13 +41,15 @@ import (
 )
 
 var (
-	nItemsFlag   = flag.Int("n", -1, "number of items to download. If negative, get them all.")
-	devFlag      = flag.Bool("dev", false, "dev mode. we reuse the same session dir (/tmp/gphotos-cdp), so we don't have to auth at every run.")
-	dlDirFlag    = flag.String("dldir", "", "where to write the downloads. defaults to $HOME/Downloads/gphotos-cdp.")
-	startFlag    = flag.String("start", "", "skip all photos until this location is reached. for debugging.")
-	runFlag      = flag.String("run", "", "the program to run on each downloaded item, right after it is dowloaded. It is also the responsibility of that program to remove the downloaded item, if desired.")
-	verboseFlag  = flag.Bool("v", false, "be verbose")
-	headlessFlag = flag.Bool("headless", false, "Start chrome browser in headless mode (cannot do authentication this way).")
+	nItemsFlag      = flag.Int("n", -1, "number of items to download. If negative, get them all.")
+	devFlag         = flag.Bool("dev", false, "dev mode. we reuse the same session dir (/tmp/gphotos-cdp), so we don't have to auth at every run.")
+	dlDirFlag       = flag.String("dldir", "", "where to write the downloads. defaults to $HOME/Downloads/gphotos-cdp.")
+	sessionDirFlag  = flag.String("sessiondir", "", "where to find a prepoluted session dir (with cookies). Only needed if --initcookies was needed in a previous run.")
+	initCookiesFlag = flag.Bool("initcookies", false, "Start a dedicated chrome process to manually populate a session dir with cookies for Google Photos. Only use if login in to Google Photos is causing trouble.")
+	startFlag       = flag.String("start", "", "skip all photos until this location is reached. for debugging.")
+	runFlag         = flag.String("run", "", "the program to run on each downloaded item, right after it is dowloaded. It is also the responsibility of that program to remove the downloaded item, if desired.")
+	verboseFlag     = flag.Bool("v", false, "be verbose")
+	headlessFlag    = flag.Bool("headless", false, "Start chrome browser in headless mode (cannot do authentication this way).")
 )
 
 var tick = 500 * time.Millisecond
@@ -63,11 +65,26 @@ func main() {
 	if !*devFlag && *headlessFlag {
 		log.Fatal("-headless only allowed in dev mode")
 	}
+	if *initCookiesFlag && *sessionDirFlag != "" {
+		log.Fatal("-initcookies and -sessiondir are mutually exclusive.")
+	}
+
 	s, err := NewSession()
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer s.Shutdown()
+
+	if *initCookiesFlag {
+		if err := s.initProfile(); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("New Session Dir created at %v. Finish authenticating to Google Photos in the current browser to populate the cookies. Then close the browser and re-run with -sessiondir.", s.profileDir)
+		return
+	}
+
+	// WIP: now for some reason, the session dir created above by initProfile is not
+	// to the liking of our own session (but it used to be). *sigh*. I give up for now,
+	// since shit is working again without having to prepopulate a session dir.
 
 	log.Printf("Session Dir: %v", s.profileDir)
 
@@ -77,6 +94,7 @@ func main() {
 
 	ctx, cancel := s.NewContext()
 	defer cancel()
+	defer s.Shutdown()
 
 	if err := s.login(ctx); err != nil {
 		log.Fatal(err)
@@ -120,16 +138,31 @@ func getLastDone(dlDir string) (string, error) {
 
 func NewSession() (*Session, error) {
 	var dir string
-	if *devFlag {
-		dir = filepath.Join(os.TempDir(), "gphotos-cdp")
-		if err := os.MkdirAll(dir, 0700); err != nil {
+	if *sessionDirFlag != "" {
+		if _, err := os.Stat(*sessionDirFlag); err != nil {
+			if os.IsNotExist(err) {
+				return nil, fmt.Errorf("Profile dir %s does not exist. Please initialize it first with -initcookies.", *sessionDirFlag)
+			}
 			return nil, err
 		}
+		dir = *sessionDirFlag
 	} else {
-		var err error
-		dir, err = ioutil.TempDir("", "gphotos-cdp")
-		if err != nil {
-			return nil, err
+		if *devFlag {
+			dir = filepath.Join(os.TempDir(), "gphotos-cdp")
+			if *initCookiesFlag {
+				if err := os.RemoveAll(dir); err != nil {
+					return nil, err
+				}
+			}
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				return nil, err
+			}
+		} else {
+			var err error
+			dir, err = ioutil.TempDir("", "gphotos-cdp")
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	dlDir := *dlDirFlag
@@ -149,6 +182,32 @@ func NewSession() (*Session, error) {
 		lastDone:   lastDone,
 	}
 	return s, nil
+}
+
+func (s *Session) initProfile() error {
+	// TODO(mpl): figure out how to automatically close it for the user and go on.
+	// Scan profile dir until hint that auth succeeded appears?
+	var binPath string
+	switch runtime.GOOS {
+	case "darwin":
+		// TODO(mpl): no idea if that is portable over other MacOS installs
+		binPath = `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`
+	case "linux":
+		var err error
+		binPath, err = exec.LookPath(`chrome`)
+		if err != nil {
+			return err
+		}
+	default:
+		return errors.New("TODO: support launching chrome on other OSes")
+	}
+	cmd := exec.Command(binPath,
+		"--no-first-run",
+		"--password-store=basic",
+		"--use-mock-keychain",
+		"--user-data-dir="+s.profileDir,
+		"https://photos.google.com")
+	return cmd.Start()
 }
 
 func (s *Session) NewContext() (context.Context, context.CancelFunc) {
